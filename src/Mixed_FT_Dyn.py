@@ -1,4 +1,6 @@
-from configs.configs import *
+from collator.collator import DynamicCollator
+from configs import *
+from functools import partial
 from huggingface_hub import snapshot_download
 from datasets import load_from_disk
 import warnings
@@ -7,7 +9,7 @@ import glob
 from transformers import AutoTokenizer, AutoModelForCausalLM, TrainerCallback, default_data_collator, Trainer, TrainingArguments, set_seed, logging 
 from sklearn.feature_extraction.text import TfidfVectorizer
 import re
-from datasets import Dataset, concatenate_datasets , load_dataset
+from datasets import Dataset, concatenate_datasets
 from transformers import BitsAndBytesConfig
 import numpy as np
 from huggingface_hub import login, upload_folder
@@ -17,11 +19,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers import TrainerCallback
+from datasets import load_dataset
 
-repo_id = ''
-full_model_path = './full_model'
+#repo_id = 'SeifAI/Nile_Chat_FT_4B_DOC_LEVEL_from_SentenceFinetune_v2'
+full_model_path = './full_model_Nile_Chat_4B'
 model_token = '' 
 
+login(token = model_token)
 SEED = 42
 random.seed(SEED)
 np.random.seed(SEED)
@@ -71,59 +75,53 @@ tokenizer.padding_side = "right"
 def preprocess(examples, max_length=2096):
     input_ids_list = []
     labels_list = []
-    attention_mask_list = []
 
-    for source, target in zip( examples["English"] , examples["Egyptian"]):
-        source = str(source) if source is not None else ""
-        target = str(target) if target is not None else ""
-        
+    for source, target in zip(examples["English"], examples["Egyptian"]):
+        source = str(source) if source else ""
+        target = str(target) if target else ""
+
         messages = [
             {"role": "user", "content": f"You are a translation expert. Translate: {source}\n Egyptian Arabic:"},
             {"role": "assistant", "content": target}
         ]
 
         prompt = tokenizer.apply_chat_template(
-            messages, 
-            tokenize=False, 
-            add_generation_prompt=False, 
+            messages,
+            tokenize=False,
+            add_generation_prompt=False,
         )
 
-        full_enc = tokenizer(prompt, add_special_tokens=False, truncation=True, max_length=max_length)
+        full_enc = tokenizer(
+            prompt,
+            add_special_tokens=False,
+            truncation=True,
+            max_length=max_length
+        )
         full_ids = full_enc["input_ids"]
 
-        # Build prompt-only (user turn + generation prompt) to find where the assistant response starts
-        prompt_only_messages = [
-            {"role": "user", "content": f"You are a translation expert. Translate: {source}\n Egyptian Arabic:"},
-        ]
         prompt_only = tokenizer.apply_chat_template(
-            prompt_only_messages,
+            [{"role": "user", "content": f"You are a translation expert. Translate: {source}\n Egyptian Arabic:"}],
             tokenize=False,
             add_generation_prompt=True,
         )
-        prompt_only_enc = tokenizer(prompt_only, add_special_tokens=False, truncation=True, max_length=max_length)
-        prompt_len = len(prompt_only_enc["input_ids"])
 
-        # Mask prompt tokens, only train on assistant response
+        prompt_len = len(tokenizer(
+            prompt_only,
+            add_special_tokens=False,
+            truncation=True,
+            max_length=max_length
+        )["input_ids"])
+
         labels = [-100] * len(full_ids)
-        for i in range(prompt_len, len(full_ids)):
-            labels[i] = full_ids[i]
+        labels[prompt_len:] = full_ids[prompt_len:]
 
-        # PAD
-        padding_length = max_length - len(full_ids)
-        input_ids = full_ids + [tokenizer.pad_token_id] * padding_length
-        labels = labels + [-100] * padding_length
-        attention_mask = [1] * len(full_ids) + [0] * padding_length
-
-        input_ids_list.append(input_ids)
+        input_ids_list.append(full_ids)
         labels_list.append(labels)
-        attention_mask_list.append(attention_mask)
 
     return {
         "input_ids": input_ids_list,
         "labels": labels_list,
-        "attention_mask": attention_mask_list
     }
-
 tokenized_train = dataset.map(preprocess, batched=True, num_proc=4)
 
 # ==========================================
@@ -157,7 +155,7 @@ for i in range(5):
 print("="*70 + "\n")
 # ==========================================
 
-data_collator = default_data_collator
+data_collator = DynamicCollator(tokenizer=tokenizer)
 
 training_args = TrainingArguments(
     output_dir = OUTPUT_DIR,
@@ -188,6 +186,6 @@ trainer = Trainer(
     data_collator=data_collator,
 )
 
-trainer.train(resume_from_checkpoint = '')
+trainer.train()
 trainer.save_model(full_model_path)
-upload_folder(folder_path=full_model_path, repo_id= repo_id, repo_type="model", token = model_token)
+#upload_folder(folder_path=full_model_path, repo_id= repo_id, repo_type="model", token = model_token)
